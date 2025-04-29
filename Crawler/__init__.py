@@ -1,60 +1,98 @@
-from mpi4py import MPI
-import time
+import json
 import logging
-
-# Import necessary libraries for web crawling (e.g., requests,
-# beautifulsoup4, scrapy), parsing, etc.
+from google.cloud import pubsub_v1
+from google.cloud import storage
+import scrapy
+from scrapy.crawler import CrawlerProcess
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - Crawler - %(levelname)s - %(message)s')
 
+# Pub/Sub setup
+project_id = "glass-episode-457618-i2"
+crawl_subscription_name = "crawl-tasks-topic-sub"
+crawl_topic_name = "crawl-tasks-topic"
+indexing_topic_name = "indexing-tasks-topic"
+
+subscriber = pubsub_v1.SubscriberClient()
+publisher = pubsub_v1.PublisherClient()
+crawl_subscription_path = subscriber.subscription_path(project_id, crawl_subscription_name)
+crawl_topic_path = publisher.topic_path(project_id, crawl_topic_name)
+indexing_topic_path = publisher.topic_path(project_id, indexing_topic_name)
+
+# Google Cloud Storage setup
+storage_client = storage.Client()
+bucket_name = "cse354-project-storage"
+bucket = storage_client.bucket(bucket_name)
+
+class CrawlerSpider(scrapy.Spider):
+    name = "crawler_spider"
+    
+    def __init__(self, url_to_crawl, *args, **kwargs):
+        super(CrawlerSpider, self).__init__(*args, **kwargs)
+        self.start_urls = [url_to_crawl]
+    
+    def parse(self, response):
+        logging.info(f"Crawling {response.url}")
+        
+        # Extract content (text)
+        content = response.css('body').get()  # Extract body content
+        if content:
+            content = content.encode('utf-8')  # Convert to bytes for GCS
+            
+            # Store content in GCS
+            blob = bucket.blob(f"crawled/{response.url.replace('/', '_')}.html")
+            blob.upload_from_string(content)
+            logging.info(f"Stored content for {response.url} in GCS")
+            
+            # Publish indexing task
+            indexing_task = {
+                "url": response.url,
+                "gcs_path": f"gs://{bucket_name}/crawled/{response.url.replace('/', '_')}.html"
+            }
+            publisher.publish(indexing_topic_path, json.dumps(indexing_task).encode('utf-8'))
+            logging.info(f"Published indexing task for {response.url}")
+        
+        # Extract new URLs
+        new_urls = response.css('a::attr(href)').getall()
+        new_urls = [response.urljoin(url) for url in new_urls if url.startswith('http')]
+        
+        # Publish new URLs back to crawl queue
+        for url in new_urls:
+            publisher.publish(crawl_topic_path, url.encode('utf-8'))
+        logging.info(f"Published {len(new_urls)} new URLs to crawl queue")
 
 def crawler_process():
-    """
-    Process for a crawler node.
-    Fetches web pages, extracts URLs, and sends results back to the master.
-    """
-    comm = MPI.COMM_WORLD
-    rank = comm.Get_rank()
-    size = comm.Get_size()
+    logging.info("Crawler node started")
 
-    logging.info(f"Crawler node started with rank {rank} of {size}")
-
-    while True:
-        status = MPI.Status()
-        url_to_crawl = comm.recv(source=0, tag=0, status=status)  # Receive URL from master (tag 0)
-        if not url_to_crawl:  # Could be a shutdown signal (if you implement one)
-            logging.info(f"Crawler {rank} received shutdown signal. Exiting.")
-            break
-
-        logging.info(f"Crawler {rank} received URL: {url_to_crawl}")
-
+    def callback(message):
+        url_to_crawl = message.data.decode('utf-8')
+        logging.info(f"Received URL to crawl: {url_to_crawl}")
+        
         try:
-            # --- Web Crawling Logic ---
-            # 1. Fetch web page content (using requests, scrapy, etc.)
-            # 2. Parse content (using BeautifulSoup4, etc.)
-            # 3. Extract new URLs from the page
-            # 4. Extract relevant text content for indexing (send to indexer later or store temporarily)
-
-            time.sleep(2)  # Simulate crawling delay
-            extracted_urls = [f"http://example.com/page_from_crawler_{rank}_{i}" for i in range(2)]  # Example extracted URLs - replace with actual extraction
-            # extracted_content = "Extracted content from " + url_to_crawl  # Example content - replace with actual content extraction
-
-            logging.info(f"Crawler {rank} crawled {url_to_crawl}, extracted {len(extracted_urls)} URLs.")
-
-            # --- Send extracted URLs back to master ---
-            comm.send(extracted_urls, dest=0, tag=1)  # Tag 1 for sending extracted URLs
-
-            # ---  Optionally send extracted content to indexer node (or queue for indexer) ---
-            # indexer_rank = 1 + (rank - 1) % (size - 2)  # Example: Send to indexer in round-robin (adjust indexer ranks accordingly)
-            # comm.send(extracted_content, dest=indexer_rank, tag=2)  # Tag 2 for sending content to indexer
-
-            comm.send(f"Crawler {rank} - Crawled URL: {url_to_crawl}", dest=0, tag=99)  # Send status update (tag 99)
-
+            # Start Scrapy crawler
+            process = CrawlerProcess(settings={
+                'DOWNLOAD_DELAY': 2,  # Politeness delay
+                'ROBOTSTXT_OBEY': True,
+                'LOG_LEVEL': 'INFO',
+            })
+            process.crawl(CrawlerSpider, url_to_crawl=url_to_crawl)
+            process.start()
+            
+            message.ack()
+            logging.info(f"Completed crawling {url_to_crawl}")
         except Exception as e:
-            logging.error(f"Crawler {rank} error crawling {url_to_crawl}: {e}")
-            comm.send(f"Error crawling {url_to_crawl}: {e}", dest=0, tag=999)  # Report error to master (tag 999)
+            logging.error(f"Error crawling {url_to_crawl}: {e}")
+            message.nack()
 
+    # Subscribe to crawl tasks
+    streaming_pull_future = subscriber.subscribe(crawl_subscription_path, callback=callback)
+    logging.info(f"Listening for crawl tasks on {crawl_subscription_path}...")
+    
+    try:
+        streaming_pull_future.result()
+    except KeyboardInterrupt:
+        streaming_pull_future.cancel()
 
 if __name__ == '__main__':
     crawler_process()
