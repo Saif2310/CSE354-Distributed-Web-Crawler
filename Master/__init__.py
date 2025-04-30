@@ -14,16 +14,20 @@ crawl_topic_path = publisher.topic_path(project_id, crawl_topic_name)
 def master_process():
     logging.info("Master node started")
 
-    # Seed URLs
-    seed_urls = ["http://example.com", "http://example.org"]
+    # Seed tasks with URLs and max_depth
+    seed_tasks = [
+        {"url": "http://example.com", "max_depth": 3},
+        {"url": "http://example.org", "max_depth": 2}
+    ]
 
-    # Publish seed URLs to crawl queue
-    for url in seed_urls:
-        publisher.publish(crawl_topic_path, url.encode('utf-8'))
-        logging.info(f"Published URL to crawl: {url}")
+    # Publish seed tasks to crawl queue
+    for task in seed_tasks:
+        task_json = json.dumps(task)
+        publisher.publish(crawl_topic_path, task_json.encode('utf-8'))
+        logging.info(f"Published task to crawl: {task_json}")
 
     # In a real system, the master might listen for completion signals or monitor progress
-    logging.info("Master node finished publishing seed URLs")
+    logging.info("Master node finished publishing seed tasks")
 
 if __name__ == '__main__':
     master_process()
