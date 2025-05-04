@@ -25,14 +25,14 @@ snapshot_repository = "gcs_snapshots"
 
 def setup_snapshot_repository():
     """Configure GCS as snapshot repository."""
-    repo_body = {
+    repo_settings = {
         "type": "gcs",
         "settings": {
             "bucket": bucket_name,
             "base_path": "snapshots"
         }
     }
-    es.snapshot.create_repository(repository=snapshot_repository, body=repo_body)
+    es.snapshot.create_repository(repository=snapshot_repository, body=repo_settings)
     logging.info("Configured GCS snapshot repository")
 
 def indexer_process():
@@ -52,20 +52,18 @@ def indexer_process():
         try:
             # Create index with mapping if it doesn’t exist
             if not es.indices.exists(index=index_name):
-                es.indices.create(index=index_name, body={
-                    "mappings": {
-                        "properties": {
-                            "url": {"type": "keyword"},
-                            "title": {"type": "text"},
-                            "content": {"type": "text"},
-                            "metadata": {
-                                "properties": {
-                                    "description": {"type": "text"},
-                                    "author": {"type": "keyword"},
-                                    "publish_date": {"type": "date", "format": "yyyy-MM-dd"},
-                                    "language": {"type": "keyword"},
-                                    "keywords": {"type": "keyword"}
-                                }
+                es.indices.create(index=index_name, mappings={
+                    "properties": {
+                        "url": {"type": "keyword"},
+                        "title": {"type": "text"},
+                        "content": {"type": "text"},
+                        "metadata": {
+                            "properties": {
+                                "description": {"type": "text"},
+                                "author": {"type": "keyword"},
+                                "publish_date": {"type": "date", "format": "yyyy-MM-dd"},
+                                "language": {"type": "keyword"},
+                                "keywords": {"type": "keyword"}
                             }
                         }
                     }
@@ -87,7 +85,7 @@ def indexer_process():
             text_blocks = " ".join(structured_data["main_content"]["text_blocks"])
             content_text = heading_text + " " + text_blocks
 
-            # Prepare document
+            # Prepare document for indexing
             doc = {
                 "url": structured_data["url"],
                 "title": structured_data["title"],
@@ -95,22 +93,28 @@ def indexer_process():
                 "metadata": structured_data["metadata"]
             }
 
+            # Remove publish_date if it's empty to avoid parsing errors
+            if not doc["metadata"]["publish_date"]:
+                del doc["metadata"]["publish_date"]
+
             # Index in Elasticsearch
-            es.index(index=index_name, body=doc)
+            es.index(index=index_name, document=doc)
             logging.info(f"Indexed content for {url} in {index_name}")
 
             # Track processed crawl IDs
             processed_crawl_ids.add(crawl_query_id)
 
-            # Take snapshot to GCS periodically or on completion
-            if len(processed_crawl_ids) % 10 == 0:  # Adjust frequency as needed
-                snapshot_name = f"snapshot_{crawl_query_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
-                es.snapshot.create(
-                    repository=snapshot_repository,
-                    snapshot=snapshot_name,
-                    body={"indices": index_name}
-                )
-                logging.info(f"Created snapshot {snapshot_name} for {index_name}")
+            # Take snapshot after every indexing task
+            snapshot_name = f"snapshot_{crawl_query_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            response = es.snapshot.create(
+                repository=snapshot_repository,
+                snapshot=snapshot_name,
+                body={"indices": index_name}
+            )
+            if response.get("accepted"):
+                logging.info(f"Created snapshot {snapshot_name} for {index_name} in GCS")
+            else:
+                logging.error(f"Failed to create snapshot {snapshot_name}: {response}")
 
             message.ack()
         except Exception as e:
