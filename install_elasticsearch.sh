@@ -9,7 +9,14 @@ echo "deb https://artifacts.elastic.co/packages/7.x/apt stable main" | tee -a /e
 apt-get update || { echo "APT update failed"; exit 1; }
 apt-get install -y elasticsearch=7.17.0
 
-# Start Elasticsearch service
+# Configure JVM heap size (adjust based on RAM)
+echo "-Xms512m" | sudo tee -a /etc/elasticsearch/jvm.options
+echo "-Xmx512m" | sudo tee -a /etc/elasticsearch/jvm.options
+
+# Install repository-gcs plugin
+sudo -u elasticsearch /usr/share/elasticsearch/bin/elasticsearch-plugin install repository-gcs
+
+# Start Elasticsearch service with extended timeout
 systemctl enable elasticsearch
 systemctl start elasticsearch
 # Wait for Elasticsearch to be ready
