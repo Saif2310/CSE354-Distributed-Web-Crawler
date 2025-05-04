@@ -13,6 +13,10 @@ apt-get install -y elasticsearch=7.17.0
 echo "-Xms512m" | sudo tee -a /etc/elasticsearch/jvm.options
 echo "-Xmx512m" | sudo tee -a /etc/elasticsearch/jvm.options
 
+# Fix permissions for plugin installation
+chown -R elasticsearch:elasticsearch /usr/share/elasticsearch/plugins
+chmod -R 755 /usr/share/elasticsearch/plugins
+
 # Install repository-gcs plugin
 sudo -u elasticsearch /usr/share/elasticsearch/bin/elasticsearch-plugin install repository-gcs
 
