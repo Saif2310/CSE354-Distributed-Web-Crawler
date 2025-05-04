@@ -17,8 +17,8 @@ echo "-Xmx512m" | sudo tee -a /etc/elasticsearch/jvm.options
 chown -R elasticsearch:elasticsearch /usr/share/elasticsearch/plugins
 chmod -R 755 /usr/share/elasticsearch/plugins
 
-# Install repository-gcs plugin
-sudo -u elasticsearch /usr/share/elasticsearch/bin/elasticsearch-plugin install repository-gcs
+# Install repository-gcs plugin non-interactively
+sudo -u elasticsearch /usr/share/elasticsearch/bin/elasticsearch-plugin install repository-gcs --batch
 
 # Start Elasticsearch service with extended timeout
 systemctl enable elasticsearch
