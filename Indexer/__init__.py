@@ -1,9 +1,10 @@
 import json
 import logging
+import time
+import uuid
 from google.cloud import pubsub_v1
 from google.cloud import storage
 from elasticsearch import Elasticsearch
-from datetime import datetime
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - Indexer - %(levelname)s - %(message)s')
@@ -22,6 +23,9 @@ bucket = storage_client.bucket(bucket_name)
 # Elasticsearch setup (local instance)
 es = Elasticsearch(["http://localhost:9200"])
 snapshot_repository = "gcs_snapshots"
+
+# Rate limiting delay in seconds (202.08 ms = 0.20208 seconds)
+RATE_LIMIT_DELAY = 0.20208
 
 def setup_snapshot_repository():
     """Configure GCS as snapshot repository."""
@@ -42,6 +46,9 @@ def indexer_process():
     processed_crawl_ids = set()
 
     def callback(message):
+        # Record start time when message is received
+        start_time = time.time()
+        
         task = json.loads(message.data.decode('utf-8'))
         url = task["url"]
         gcs_path = task["gcs_path"]
@@ -104,24 +111,34 @@ def indexer_process():
             # Track processed crawl IDs
             processed_crawl_ids.add(crawl_query_id)
 
-            # Take snapshot after every indexing task
-            snapshot_name = f"snapshot_{crawl_query_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            # Take snapshot after every indexing task with UUID-based name
+            snapshot_name = f"snapshot_{crawl_query_id}_{uuid.uuid4().hex}"
             response = es.snapshot.create(
                 repository=snapshot_repository,
                 snapshot=snapshot_name,
                 body={"indices": index_name}
             )
             if response.get("accepted"):
-                logging.info(f"Created snapshot {snapshot_name} for {index_name} in GCS")
+                # Calculate duration from message receipt to snapshot completion
+                end_time = time.time()
+                duration_ms = (end_time - start_time) * 1000  # Convert to milliseconds
+                logging.info(f"Created snapshot {snapshot_name} for {index_name} in GCS. Processing took {duration_ms:.2f} ms")
             else:
                 logging.error(f"Failed to create snapshot {snapshot_name}: {response}")
 
+            # Acknowledge the message
             message.ack()
+
         except Exception as e:
             logging.error(f"Error indexing {url}: {e}")
             message.nack()
 
-    # Subscribe to indexing tasks
+        # Enforce rate limiting: wait until at least RATE_LIMIT_DELAY has elapsed since the start
+        elapsed_time = time.time() - start_time
+        if elapsed_time < RATE_LIMIT_DELAY:
+            time.sleep(RATE_LIMIT_DELAY - elapsed_time)
+
+    # Subscribe to indexing tasks with flow control to limit concurrent messages
     streaming_pull_future = subscriber.subscribe(indexing_subscription_path, callback=callback)
     logging.info(f"Listening for indexing tasks on {indexing_subscription_path}...")
     
