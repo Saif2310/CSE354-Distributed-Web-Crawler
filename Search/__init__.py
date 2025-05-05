@@ -3,13 +3,14 @@ import logging
 from elasticsearch import Elasticsearch
 from google.cloud import pubsub_v1
 from google.cloud.pubsub_v1.subscriber import futures
+import uuid
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - Search - %(levelname)s - %(message)s')
 
 # Pub/Sub setup
 project_id = "glass-episode-457618-i2"
-search_subscription_name = "search-tasks-sub"
+search_subscription_name = "search-tasks-topic-sub"
 search_results_topic_name = "search-results-topic"
 subscriber = pubsub_v1.SubscriberClient()
 publisher = pubsub_v1.PublisherClient()
@@ -43,7 +44,7 @@ def get_snapshots_for_crawl_query(crawl_query_id):
         return []
 
 def merge_indices(crawl_query_id, temp_indices):
-    """Merge multiple temporary indices into a single index."""
+    """Merge multiple temporary indices into a single index with deduplication."""
     final_index = f"webpages_{crawl_query_id}"
     
     # Create the final index if it doesn't exist
@@ -67,14 +68,24 @@ def merge_indices(crawl_query_id, temp_indices):
             }
         })
     
-    # Reindex all temporary indices into the final index
+    # Reindex all temporary indices into the final index with deduplication
     for temp_index in temp_indices:
         reindex_body = {
-            "source": {"index": temp_index},
-            "dest": {"index": final_index}
+            "source": {
+                "index": temp_index
+            },
+            "dest": {
+                "index": final_index,
+                "op_type": "create"  # Only create new documents, skip if exists
+            },
+            "script": {
+                "source": "ctx._id = ctx._source.url",  # Use URL as the document ID for deduplication
+                "lang": "painless"
+            },
+            "conflict": "proceed"  # Proceed on conflicts (duplicate URLs)
         }
         es.reindex(body=reindex_body)
-        logging.info(f"Reindexed {temp_index} into {final_index}")
+        logging.info(f"Reindexed {temp_index} into {final_index} with deduplication")
     
     # Delete temporary indices
     for temp_index in temp_indices:
@@ -92,14 +103,22 @@ def search_query(crawl_query_id, query_text):
         logging.error(f"No snapshots found for crawl_query_id {crawl_query_id}")
         return []
 
-    # Restore each snapshot into a temporary index
+    # Restore each snapshot into a unique temporary index
     temp_indices = []
     for i, snapshot_name in enumerate(snapshot_names):
-        temp_index = f"temp_{crawl_query_id}_{i}"
+        temp_index = f"temp_{crawl_query_id}_{i}_{uuid.uuid4().hex[:8]}"  # Unique name with UUID
+        if es.indices.exists(index=temp_index):
+            es.indices.delete(index=temp_index)
+            logging.info(f"Deleted existing temporary index {temp_index}")
         es.snapshot.restore(
             repository=snapshot_repository,
             snapshot=snapshot_name,
-            body={"indices": f"webpages_{crawl_query_id}", "rename_pattern": "webpages_(.+)", "rename_replacement": temp_index}
+            body={
+                "indices": f"webpages_{crawl_query_id}",
+                "rename_pattern": "webpages_(.+)",
+                "rename_replacement": temp_index
+            },
+            wait_for_completion=True  # Ensure restore completes
         )
         temp_indices.append(temp_index)
         logging.info(f"Restored snapshot {snapshot_name} into {temp_index}")
@@ -129,6 +148,9 @@ def callback(message):
 
     try:
         results = search_query(crawl_query_id, query_text)
+        # Intercept and print the results before publishing
+        print("Search Results:", json.dumps(results, indent=2))
+        
         result_message = {
             "crawl_query_id": crawl_query_id,
             "results": results
