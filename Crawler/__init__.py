@@ -84,8 +84,8 @@ def clean_content(response):
 class CrawlerSpider(scrapy.Spider):
     name = "crawler_spider"
     
-    def __init__(self, url_to_crawl, current_depth, max_depth, crawl_query_id, *args, **kwargs):
-        super(CrawlerSpider, self).__init__(*args, **kwargs)
+    def _init_(self, url_to_crawl, current_depth, max_depth, crawl_query_id, *args, **kwargs):
+        super(CrawlerSpider, self)._init_(*args, **kwargs)
         self.start_urls = [url_to_crawl]
         self.current_depth = current_depth
         self.max_depth = max_depth
@@ -176,10 +176,8 @@ def crawler_process():
         }, timeout=60)
 
         if not response.received_messages:
-            logger.info("No messages received, waiting...")
             if not url_depths:
                 crawled_urls.clear()
-                logger.info("No pending URLs to crawl, reset crawled_urls set.")
             return
 
         for message in response.received_messages:
@@ -232,5 +230,5 @@ def crawler_process():
     lc.start(1.0)
     reactor.run()
 
-if __name__ == '__main__':
+if _name_ == '_main_':
     crawler_process()
