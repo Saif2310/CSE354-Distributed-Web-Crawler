@@ -5,6 +5,7 @@ import uuid
 from google.cloud import pubsub_v1
 from google.cloud import storage
 from elasticsearch import Elasticsearch
+from elasticsearch.exceptions import TransportError
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - Indexer - %(levelname)s - %(message)s')
@@ -28,7 +29,7 @@ snapshot_repository = "gcs_snapshots"
 RATE_LIMIT_DELAY = 0.20208
 
 def setup_snapshot_repository():
-    """Configure GCS as snapshot repository."""
+    """Configure GCS as snapshot repository with retry logic for errors."""
     repo_settings = {
         "type": "gcs",
         "settings": {
@@ -36,8 +37,27 @@ def setup_snapshot_repository():
             "base_path": "snapshots"
         }
     }
-    es.snapshot.create_repository(repository=snapshot_repository, body=repo_settings)
-    logging.info("Configured GCS snapshot repository")
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            es.snapshot.create_repository(repository=snapshot_repository, body=repo_settings)
+            logging.info("Configured GCS snapshot repository")
+            return
+        except TransportError as e:
+            if 'repository_exception' in str(e) and attempt < max_retries - 1:
+                logging.warning("Repository state inconsistent during setup. Recovering repository...")
+                es.snapshot.delete_repository(repository=snapshot_repository, ignore=[404])
+                continue
+            else:
+                raise
+    raise Exception(f"Failed to configure snapshot repository after {max_retries} attempts")
+
+def recover_repository():
+    """Recover the repository by deleting and re-adding it."""
+    logging.warning("Repository state inconsistent. Recovering repository...")
+    es.snapshot.delete_repository(repository=snapshot_repository, ignore=[404])
+    setup_snapshot_repository()
+    logging.info("Recovered GCS snapshot repository")
 
 def indexer_process():
     logging.info("Indexer node started")
@@ -104,31 +124,37 @@ def indexer_process():
             if not doc["metadata"]["publish_date"]:
                 del doc["metadata"]["publish_date"]
 
-            # Index in Elasticsearch
-            es.index(index=index_name, document=doc)
+            # Index in Elasticsearch with URL as _id
+            es.index(index=index_name, id=doc["url"], document=doc)
             logging.info(f"Indexed content for {url} in {index_name}")
 
-            # Track processed crawl IDs
-            processed_crawl_ids.add(crawl_query_id)
-
-            # Take snapshot after every indexing task with UUID-based name
+            # Take snapshot with retry loop for repository errors
             snapshot_name = f"snapshot_{crawl_query_id}_{uuid.uuid4().hex}"
-            response = es.snapshot.create(
-                repository=snapshot_repository,
-                snapshot=snapshot_name,
-                body={"indices": index_name}
-            )
-            if response.get("accepted"):
-                # Calculate duration from message receipt to snapshot completion
-                end_time = time.time()
-                duration_ms = (end_time - start_time) * 1000  # Convert to milliseconds
-                logging.info(f"Created snapshot {snapshot_name} for {index_name} in GCS. Processing took {duration_ms:.2f} ms")
+            max_retries = 5
+            for attempt in range(max_retries):
+                try:
+                    response = es.snapshot.create(
+                        repository=snapshot_repository,
+                        snapshot=snapshot_name,
+                        body={"indices": index_name},
+                        wait_for_completion=True
+                    )
+                    if response.get("snapshot", {}).get("state") == "SUCCESS":
+                        logging.info(f"Created snapshot {snapshot_name} for {index_name} in GCS")
+                        break
+                    else:
+                        logging.error(f"Failed to create snapshot {snapshot_name}: {response}")
+                        raise Exception("Snapshot creation not successful")
+                except TransportError as e:
+                    if 'repository_exception' in str(e) and attempt < max_retries - 1:
+                        recover_repository()
+                        continue
+                    else:
+                        raise
             else:
-                logging.error(f"Failed to create snapshot {snapshot_name}: {response}")
+                raise Exception(f"Failed to create snapshot after {max_retries} attempts")
 
-            # Acknowledge the message
             message.ack()
-
         except Exception as e:
             logging.error(f"Error indexing {url}: {e}")
             message.nack()
@@ -138,7 +164,7 @@ def indexer_process():
         if elapsed_time < RATE_LIMIT_DELAY:
             time.sleep(RATE_LIMIT_DELAY - elapsed_time)
 
-    # Subscribe to indexing tasks with flow control to limit concurrent messages
+    # Subscribe to indexing tasks
     streaming_pull_future = subscriber.subscribe(indexing_subscription_path, callback=callback)
     logging.info(f"Listening for indexing tasks on {indexing_subscription_path}...")
     
