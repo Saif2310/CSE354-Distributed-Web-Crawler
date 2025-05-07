@@ -1,0 +1,31 @@
+.crawl-row {
+    @apply flex items-center mb-2;
+}
+
+.url-input {
+    @apply flex-1 p-2 border rounded;
+}
+
+.depth-input {
+    @apply w-16 p-2 border rounded ml-2;
+}
+
+.add-btn {
+    @apply bg-green-500 text-white p-2 rounded ml-2;
+}
+
+.remove-btn {
+    @apply bg-red-500 text-white p-2 rounded ml-2;
+}
+
+#results {
+    @apply bg-white p-4 rounded border w-full h-48 overflow-auto;
+}
+
+.loading-bar {
+    @apply w-full bg-gray-300 h-6 rounded overflow-hidden;
+}
+
+#progress {
+    @apply bg-green-500 h-6 rounded transition-all duration-300;
+}
