@@ -1,12 +1,37 @@
 let rowCount = 1;
 
-document.addEventListener('click', function(event) {
-    if (event.target.classList.contains('add-btn')) {
-        addRow();
-    } else if (event.target.classList.contains('remove-btn')) {
-        removeRow();
+// Function to attach event listeners after DOM is loaded
+function attachEventListeners() {
+    const crawlBtn = document.getElementById('crawl-btn');
+    const goToSearchBtn = document.getElementById('go-to-search-btn');
+    const searchBtn = document.getElementById('search-btn');
+    const backBtn = document.getElementById('back-btn');
+
+    if (crawlBtn) {
+        crawlBtn.addEventListener('click', initiateCrawl);
     }
-});
+    if (goToSearchBtn) {
+        goToSearchBtn.addEventListener('click', goToSearch);
+    }
+    if (searchBtn) {
+        searchBtn.addEventListener('click', initiateSearch);
+    }
+    if (backBtn) {
+        backBtn.addEventListener('click', goToCrawl);
+    }
+
+    // Attach event listeners for dynamically added buttons
+    document.addEventListener('click', function(event) {
+        if (event.target.classList.contains('add-btn')) {
+            addRow();
+        } else if (event.target.classList.contains('remove-btn')) {
+            removeRow();
+        }
+    });
+}
+
+// Run after DOM is fully loaded
+document.addEventListener('DOMContentLoaded', attachEventListeners);
 
 function addRow() {
     rowCount++;
@@ -42,10 +67,6 @@ function updateButtons() {
     }
 }
 
-document.getElementById('crawl-btn').addEventListener('click', initiateCrawl);
-document.getElementById('search-btn').addEventListener('click', initiateSearch);
-document.getElementById('back-btn').addEventListener('click', goToCrawl);
-
 function initiateCrawl() {
     const rows = document.getElementById('crawl-inputs').children;
     const tasks = [];
@@ -62,7 +83,7 @@ function initiateCrawl() {
         }
         tasks.push({ url, max_depth: parseInt(depth) });
     }
-    fetch('http://<master-node-ip>:5000/crawl', {
+    fetch('http://10.0.0.193:5000/crawl', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(tasks)
@@ -94,7 +115,7 @@ function initiateSearch() {
         alert('No crawl session found. Please initiate a crawl first.');
         return;
     }
-    fetch('http://<master-node-ip>:5000/search', {
+    fetch('http://10.0.0.193:5000/search', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ keyword, uuid })
@@ -106,7 +127,7 @@ function initiateSearch() {
     .catch(error => alert('Error initiating search: ' + error));
 }
 
-const ws = new WebSocket('ws://<master-node-ip>:8765');
+const ws = new WebSocket('ws://10.0.0.193:8765');
 ws.onmessage = function(event) {
     const data = JSON.parse(event.data);
     if (data.type === 'crawled') {
