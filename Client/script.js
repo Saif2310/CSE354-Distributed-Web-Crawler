@@ -1,6 +1,7 @@
 let rowCount = 1;
+let crawlUUID = null;
+let deadTimers = {};
 
-// Function to attach event listeners after DOM is loaded
 function attachEventListeners() {
     const crawlBtn = document.getElementById('crawl-btn');
     const goToSearchBtn = document.getElementById('go-to-search-btn');
@@ -20,7 +21,6 @@ function attachEventListeners() {
         backBtn.addEventListener('click', goToCrawl);
     }
 
-    // Attach event listeners for dynamically added buttons
     document.addEventListener('click', function(event) {
         if (event.target.classList.contains('add-btn')) {
             addRow();
@@ -30,7 +30,6 @@ function attachEventListeners() {
     });
 }
 
-// Run after DOM is fully loaded
 document.addEventListener('DOMContentLoaded', attachEventListeners);
 
 function addRow() {
@@ -83,15 +82,26 @@ function initiateCrawl() {
         }
         tasks.push({ url, max_depth: parseInt(depth) });
     }
-    fetch('http://10.0.0.193:5000/crawl', {
+    fetch('/crawl', {  // Changed to relative path
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(tasks)
     })
     .then(response => response.json())
     .then(data => {
-        localStorage.setItem('crawl_uuid', data.uuid);
-        alert('Crawl initiated with UUID: ' + data.uuid);
+        crawlUUID = data.uuid;
+        localStorage.setItem('crawl_uuid', crawlUUID);
+        alert('Crawl initiated with UUID: ' + crawlUUID);
+        // Ensure WebSocket is open before subscribing
+        if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: "subscribe", crawl_query_id: crawlUUID }));
+            console.log('Subscribed to crawl_query_id:', crawlUUID);
+        } else {
+            ws.onopen = function() {
+                ws.send(JSON.stringify({ type: "subscribe", crawl_query_id: crawlUUID }));
+                console.log('Subscribed to crawl_query_id:', crawlUUID);
+            };
+        }
     })
     .catch(error => alert('Error initiating crawl: ' + error));
 }
@@ -115,7 +125,7 @@ function initiateSearch() {
         alert('No crawl session found. Please initiate a crawl first.');
         return;
     }
-    fetch('http://10.0.0.193:5000/search', {
+    fetch('/search', {  // Changed to relative path
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ keyword, uuid })
@@ -127,22 +137,67 @@ function initiateSearch() {
     .catch(error => alert('Error initiating search: ' + error));
 }
 
-const ws = new WebSocket('ws://10.0.0.193:8765');
+const ws = new WebSocket('ws://' + window.location.host + '/ws');  // Use relative path based on current host
+ws.onopen = function() {
+    console.log('WebSocket connected');
+};
+ws.onerror = function(error) {
+    console.error('WebSocket error:', error);
+};
+ws.onclose = function() {
+    console.log('WebSocket closed');
+};
 ws.onmessage = function(event) {
+    console.log('Received message:', event.data);
     const data = JSON.parse(event.data);
-    if (data.type === 'crawled') {
-        document.getElementById('crawled-count').innerText = 'Number of websites Crawled: ' + data.count;
-    } else if (data.type === 'indexed') {
-        document.getElementById('indexed-count').innerText = 'Number of websites Indexed: ' + data.count;
-    } else if (data.type === 'crawl_complete') {
+    // Handle crawl updates
+    if ("crawled_count" in data && data.crawl_query_id === crawlUUID) {
+        const count = parseInt(document.getElementById('crawled-count').innerText.split(': ')[1]) + data.crawled_count;
+        document.getElementById('crawled-count').innerText = 'Number of websites Crawled: ' + count;
+    } else if ("indexed_count" in data && data.crawl_query_id === crawlUUID) {
+        const count = parseInt(document.getElementById('indexed-count').innerText.split(': ')[1]) + data.indexed_count;
+        document.getElementById('indexed-count').innerText = 'Number of websites Indexed: ' + count;
+    } else if ("crawl_complete" in data && data.crawl_query_id === crawlUUID) {
         document.getElementById('crawl-complete').style.backgroundColor = '#28a745';
-    } else if (data.type === 'index_complete') {
+    } else if ("index_complete" in data && data.crawl_query_id === crawlUUID) {
         document.getElementById('index-complete').style.backgroundColor = '#28a745';
-    } else if (data.type === 'search_progress') {
+    } else if ("search_progress" in data && data.crawl_query_id === crawlUUID) {
         const percentage = (data.processed / data.total) * 100;
         document.getElementById('progress').style.width = percentage + '%';
         document.getElementById('progress-text').innerText = percentage.toFixed(2) + '%';
-    } else if (data.type === 'search_results') {
+    } else if ("search_results" in data && data.crawl_query_id === crawlUUID) {
         document.getElementById('results').innerText = JSON.stringify(data.results, null, 2);
+    } else if (data.type === 'machine_active') {
+        const machineKey = `${data.machine_type}-${data.machine_id}`;
+        let nodeDiv = document.getElementById(machineKey);
+        if (!nodeDiv) {
+            nodeDiv = document.createElement('div');
+            nodeDiv.id = machineKey;
+            nodeDiv.className = 'p-1 bg-green-500 text-white rounded mt-1';
+            nodeDiv.innerText = `${data.machine_type}: ${data.machine_id} is running`;
+            if (data.machine_type === 'Crawler') {
+                document.getElementById('crawler-nodes').appendChild(nodeDiv);
+            } else if (data.machine_type === 'Indexer') {
+                document.getElementById('indexer-nodes').appendChild(nodeDiv);
+            }
+        } else {
+            nodeDiv.className = 'p-1 bg-green-500 text-white rounded mt-1';
+            nodeDiv.innerText = `${data.machine_type}: ${data.machine_id} is running`;
+        }
+        if (deadTimers[machineKey]) {
+            clearTimeout(deadTimers[machineKey]);
+            delete deadTimers[machineKey];
+        }
+    } else if (data.type === 'machine_dead') {
+        const machineKey = `${data.machine_type}-${data.machine_id}`;
+        let nodeDiv = document.getElementById(machineKey);
+        if (nodeDiv) {
+            nodeDiv.className = 'p-1 bg-yellow-500 text-white rounded mt-1';
+            nodeDiv.innerText = `${data.machine_type}: ${data.machine_id} is dead, should be replaced soon`;
+            deadTimers[machineKey] = setTimeout(() => {
+                UNIQUEnodeDiv.remove();
+                delete deadTimers[machineKey];
+            }, 15 * 60 * 1000);
+        }
     }
 };
