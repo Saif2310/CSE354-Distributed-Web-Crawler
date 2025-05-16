@@ -8,6 +8,8 @@ from scrapy.crawler import CrawlerProcess
 from twisted.internet import reactor, defer
 from twisted.internet.task import LoopingCall
 from urllib.parse import urlparse
+import time
+from urllib.request import Request, urlopen
 
 # Configure a specific logger for Crawler
 logger = logging.getLogger('Crawler')
@@ -23,12 +25,16 @@ project_id = "glass-episode-457618-i2"
 crawl_subscription_name = "crawl-tasks-topic-sub"
 crawl_topic_name = "crawl-tasks-topic"
 indexing_topic_name = "indexing-tasks-topic"
+updates_topic_name = "updates-subscription"
+health_check_topic_name = "health-check"
 
 subscriber = pubsub_v1.SubscriberClient()
 publisher = pubsub_v1.PublisherClient()
 crawl_subscription_path = subscriber.subscription_path(project_id, crawl_subscription_name)
 crawl_topic_path = publisher.topic_path(project_id, crawl_topic_name)
 indexing_topic_path = publisher.topic_path(project_id, indexing_topic_name)
+updates_topic_path = publisher.topic_path(project_id, updates_topic_name)
+health_check_topic_path = publisher.topic_path(project_id, health_check_topic_name)
 
 # Google Cloud Storage setup
 storage_client = storage.Client()
@@ -81,11 +87,21 @@ def clean_content(response):
     }
     return structured_data
 
+def get_machine_id():
+    """Fetch the machine ID from GCP metadata."""
+    try:
+        req = Request('http://metadata.google.internal/computeMetadata/v1/instance/id', headers={'Metadata-Flavor': 'Google'})
+        response = urlopen(req)
+        return response.read().decode('utf-8')
+    except Exception as e:
+        logger.error(f"Failed to get machine ID: {e}")
+        return "unknown"
+
 class CrawlerSpider(scrapy.Spider):
     name = "crawler_spider"
     
-    def _init_(self, url_to_crawl, current_depth, max_depth, crawl_query_id, *args, **kwargs):
-        super(CrawlerSpider, self)._init_(*args, **kwargs)
+    def __init__(self, url_to_crawl, current_depth, max_depth, crawl_query_id, *args, **kwargs):
+        super(CrawlerSpider, self).__init__(*args, **kwargs)
         self.start_urls = [url_to_crawl]
         self.current_depth = current_depth
         self.max_depth = max_depth
@@ -105,6 +121,12 @@ class CrawlerSpider(scrapy.Spider):
         }
         publisher.publish(indexing_topic_path, json.dumps(indexing_task).encode('utf-8'))
         logger.info(f"Published indexing task for {response.url}")
+        
+        # Publish notification for crawled page
+        crawl_message = {"crawled_count": 1, "crawl_query_id": self.crawl_query_id}
+        publisher.publish(updates_topic_path, json.dumps(crawl_message).encode('utf-8'))
+        logger.info(f"Published crawled notification: {crawl_message}")
+        
         if self.current_depth < self.max_depth:
             hrefs = response.css('a::attr(href)').getall()
             new_urls = [response.urljoin(href) for href in hrefs]
@@ -166,69 +188,94 @@ def callback_wrapper(success, ack_id, subscription_path):
         logger.info(f"Failed to crawl, nack message for retry")
 
 def crawler_process():
+    global machine_id
+    machine_id = get_machine_id()
     logger.info("Crawler node started")
     logger.info(f"Listening for crawl tasks on {crawl_subscription_path}...")
+    
+    def send_heartbeat():
+        heartbeat_message = json.dumps({
+            "type": "heartbeat",
+            "machine_type": "Crawler",
+            "machine_id": machine_id
+        })
+        publisher.publish(health_check_topic_path, heartbeat_message.encode('utf-8'))
+        logger.info(f"Published heartbeat: {heartbeat_message}")
+    
+    hc_lc = LoopingCall(send_heartbeat)
+    hc_lc.start(10.0)
+    
+    last_message_times = {}  # Track last message time per crawl_query_id
+    
+    def check_completion():
+        current_time = time.time()
+        for crawl_query_id, last_time in list(last_message_times.items()):
+            if current_time - last_time > 30:  # Increased timeout to 30 seconds
+                completion_message = {"crawl_complete": True, "crawl_query_id": crawl_query_id}
+                publisher.publish(updates_topic_path, json.dumps(completion_message).encode('utf-8'))
+                logger.info(f"Published crawl completion for {crawl_query_id}: {completion_message}")
+                del last_message_times[crawl_query_id]
 
+    completion_lc = LoopingCall(check_completion)
+    completion_lc.start(1.0)
+    
     def process_message():
         response = subscriber.pull(request={
             "subscription": crawl_subscription_path,
             "max_messages": 1,
         }, timeout=60)
 
-        if not response.received_messages:
-            if not url_depths:
-                crawled_urls.clear()
-            return
+        if response.received_messages:
+            for message in response.received_messages:
+                try:
+                    task = json.loads(message.message.data.decode('utf-8'))
+                    url_to_crawl = task["url"]
+                    max_depth = task["max_depth"]
+                    current_depth = task.get("current_depth", 1)
+                    crawl_query_id = task["crawl_query_id"]
+                    last_message_times[crawl_query_id] = time.time()
+                except (json.JSONDecodeError, KeyError) as e:
+                    logger.error(f"Invalid message format: {e}")
+                    subscriber.acknowledge(request={
+                        "subscription": crawl_subscription_path,
+                        "ack_ids": [message.ack_id],
+                    })
+                    continue
 
-        for message in response.received_messages:
-            try:
-                task = json.loads(message.message.data.decode('utf-8'))
-                url_to_crawl = task["url"]
-                max_depth = task["max_depth"]
-                current_depth = task.get("current_depth", 1)
-                crawl_query_id = task["crawl_query_id"]
-            except (json.JSONDecodeError, KeyError) as e:
-                logger.error(f"Invalid message format: {e}")
-                subscriber.acknowledge(request={
-                    "subscription": crawl_subscription_path,
-                    "ack_ids": [message.ack_id],
-                })
-                continue
+                logger.info(f"Received URL to crawl: {url_to_crawl} at depth {current_depth} with max depth {max_depth} and crawl_query_id {crawl_query_id}")
 
-            logger.info(f"Received URL to crawl: {url_to_crawl} at depth {current_depth} with max depth {max_depth} and crawl_query_id {crawl_query_id}")
+                if not is_valid_url(url_to_crawl):
+                    logger.error(f"Invalid URL: {url_to_crawl}")
+                    subscriber.acknowledge(request={
+                        "subscription": crawl_subscription_path,
+                        "ack_ids": [message.ack_id],
+                    })
+                    continue
 
-            if not is_valid_url(url_to_crawl):
-                logger.error(f"Invalid URL: {url_to_crawl}")
-                subscriber.acknowledge(request={
-                    "subscription": crawl_subscription_path,
-                    "ack_ids": [message.ack_id],
-                })
-                continue
+                if url_to_crawl in crawled_urls:
+                    logger.info(f"URL already crawled: {url_to_crawl}, skipping...")
+                    subscriber.acknowledge(request={
+                        "subscription": crawl_subscription_path,
+                        "ack_ids": [message.ack_id],
+                    })
+                    url_depths.pop(url_to_crawl, None)
+                    continue
 
-            if url_to_crawl in crawled_urls:
-                logger.info(f"URL already crawled: {url_to_crawl}, skipping...")
-                subscriber.acknowledge(request={
-                    "subscription": crawl_subscription_path,
-                    "ack_ids": [message.ack_id],
-                })
-                url_depths.pop(url_to_crawl, None)
-                continue
+                if current_depth > max_depth:
+                    logger.info(f"Depth {current_depth} exceeds max depth {max_depth} for {url_to_crawl}, skipping...")
+                    subscriber.acknowledge(request={
+                        "subscription": crawl_subscription_path,
+                        "ack_ids": [message.ack_id],
+                    })
+                    url_depths.pop(url_to_crawl, None)
+                    continue
 
-            if current_depth > max_depth:
-                logger.info(f"Depth {current_depth} exceeds max depth {max_depth} for {url_to_crawl}, skipping...")
-                subscriber.acknowledge(request={
-                    "subscription": crawl_subscription_path,
-                    "ack_ids": [message.ack_id],
-                })
-                url_depths.pop(url_to_crawl, None)
-                continue
-
-            crawl_url(url_to_crawl, current_depth, max_depth, crawl_query_id, lambda success: callback_wrapper(success, message.ack_id, crawl_subscription_path))
-            crawled_urls.add(url_to_crawl)
+                crawl_url(url_to_crawl, current_depth, max_depth, crawl_query_id, lambda success: callback_wrapper(success, message.ack_id, crawl_subscription_path))
+                crawled_urls.add(url_to_crawl)
 
     lc = LoopingCall(process_message)
     lc.start(1.0)
     reactor.run()
 
-if _name_ == '_main_':
+if __name__ == '__main__':
     crawler_process()
