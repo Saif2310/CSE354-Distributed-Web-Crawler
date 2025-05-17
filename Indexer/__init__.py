@@ -8,7 +8,6 @@ from google.cloud import storage
 from elasticsearch import Elasticsearch
 from elasticsearch.exceptions import TransportError
 from twisted.internet import reactor
-from twisted.internet.task import LoopingCall
 from urllib.request import Request, urlopen
 
 # Configure logging
@@ -93,19 +92,11 @@ def run_heartbeat_in_thread(machine_id):
         send_heartbeat()
         time.sleep(10.0)
 
-def indexer_process():
-    logging.info("Indexer node started")
-    setup_snapshot_repository()
-    machine_id = get_machine_id()
-    processed_crawl_ids = set()
-    last_message_times = {}  # Track last message time per crawl_query_id
-
-    # Start heartbeat in a separate thread
-    heartbeat_thread = threading.Thread(target=run_heartbeat_in_thread, args=(machine_id,), daemon=True)
-    heartbeat_thread.start()
-
+def run_completion_in_thread(last_message_times):
+    """Run periodic completion checks in a separate thread."""
     def check_completion():
         current_time = time.time()
+        # Copy last_message_times to avoid concurrent modification
         for crawl_query_id, last_time in list(last_message_times.items()):
             if current_time - last_time > 30:  # Timeout after 30 seconds
                 index_name = f"webpages_{crawl_query_id}"
@@ -133,10 +124,26 @@ def indexer_process():
                 completion_message = {"index_complete": True, "crawl_query_id": crawl_query_id}
                 publisher.publish(updates_topic_path, json.dumps(completion_message).encode('utf-8'))
                 logging.info(f"Published index completion for {crawl_query_id}: {completion_message}")
-                del last_message_times[crawl_query_id]
+                last_message_times.pop(crawl_query_id, None)
 
-    completion_lc = LoopingCall(check_completion)
-    completion_lc.start(1.0)
+    while True:
+        check_completion()
+        time.sleep(1.0)
+
+def indexer_process():
+    logging.info("Indexer node started")
+    setup_snapshot_repository()
+    machine_id = get_machine_id()
+    processed_crawl_ids = set()
+    last_message_times = {}  # Track last message time per crawl_query_id
+
+    # Start heartbeat in a separate thread
+    heartbeat_thread = threading.Thread(target=run_heartbeat_in_thread, args=(machine_id,), daemon=True)
+    heartbeat_thread.start()
+
+    # Start completion checks in a separate thread
+    completion_thread = threading.Thread(target=run_completion_in_thread, args=(last_message_times,), daemon=True)
+    completion_thread.start()
 
     def callback(message):
         start_time = time.time()
