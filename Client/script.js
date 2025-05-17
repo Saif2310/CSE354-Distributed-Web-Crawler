@@ -1,6 +1,9 @@
+import { initializeWebSocket, subscribe, setMessageHandler } from './websocket.js';
+
 let rowCount = 1;
 let crawlUUID = null;
 let deadTimers = {};
+let isCrawlActive = false; // Track active crawl
 
 function attachEventListeners() {
     const crawlBtn = document.getElementById('crawl-btn');
@@ -29,8 +32,6 @@ function attachEventListeners() {
         }
     });
 }
-
-document.addEventListener('DOMContentLoaded', attachEventListeners);
 
 function addRow() {
     rowCount++;
@@ -66,7 +67,19 @@ function updateButtons() {
     }
 }
 
+function resetCrawlState() {
+    document.getElementById('crawled-count').innerText = 'Number of websites Crawled: 0';
+    document.getElementById('indexed-count').innerText = 'Number of websites Indexed: 0';
+    document.getElementById('crawl-complete').style.backgroundColor = '';
+    document.getElementById('index-complete').style.backgroundColor = '';
+}
+
 function initiateCrawl() {
+    if (isCrawlActive) {
+        alert('A crawl is already in progress');
+        return;
+    }
+    resetCrawlState();
     const rows = document.getElementById('crawl-inputs').children;
     const tasks = [];
     for (let row of rows) {
@@ -82,7 +95,9 @@ function initiateCrawl() {
         }
         tasks.push({ url, max_depth: parseInt(depth) });
     }
-    fetch('/crawl', {  // Changed to relative path
+    isCrawlActive = true;
+    document.getElementById('crawl-btn').disabled = true;
+    fetch('/crawl', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(tasks)
@@ -92,18 +107,13 @@ function initiateCrawl() {
         crawlUUID = data.uuid;
         localStorage.setItem('crawl_uuid', crawlUUID);
         alert('Crawl initiated with UUID: ' + crawlUUID);
-        // Ensure WebSocket is open before subscribing
-        if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: "subscribe", crawl_query_id: crawlUUID }));
-            console.log('Subscribed to crawl_query_id:', crawlUUID);
-        } else {
-            ws.onopen = function() {
-                ws.send(JSON.stringify({ type: "subscribe", crawl_query_id: crawlUUID }));
-                console.log('Subscribed to crawl_query_id:', crawlUUID);
-            };
-        }
+        subscribe(crawlUUID);
     })
-    .catch(error => alert('Error initiating crawl: ' + error));
+    .catch(error => {
+        alert('Error initiating crawl: ' + error);
+        isCrawlActive = false;
+        document.getElementById('crawl-btn').disabled = false;
+    });
 }
 
 function goToSearch() {
@@ -125,7 +135,7 @@ function initiateSearch() {
         alert('No crawl session found. Please initiate a crawl first.');
         return;
     }
-    fetch('/search', {  // Changed to relative path
+    fetch('/search', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ keyword, uuid })
@@ -137,37 +147,40 @@ function initiateSearch() {
     .catch(error => alert('Error initiating search: ' + error));
 }
 
-const ws = new WebSocket('ws://' + window.location.host + '/ws');  // Use relative path based on current host
-ws.onopen = function() {
-    console.log('WebSocket connected');
-};
-ws.onerror = function(error) {
-    console.error('WebSocket error:', error);
-};
-ws.onclose = function() {
-    console.log('WebSocket closed');
-};
-ws.onmessage = function(event) {
-    console.log('Received message:', event.data);
-    const data = JSON.parse(event.data);
-    // Handle crawl updates
-    if ("crawled_count" in data && data.crawl_query_id === crawlUUID) {
-        const count = parseInt(document.getElementById('crawled-count').innerText.split(': ')[1]) + data.crawled_count;
-        document.getElementById('crawled-count').innerText = 'Number of websites Crawled: ' + count;
-    } else if ("indexed_count" in data && data.crawl_query_id === crawlUUID) {
-        const count = parseInt(document.getElementById('indexed-count').innerText.split(': ')[1]) + data.indexed_count;
-        document.getElementById('indexed-count').innerText = 'Number of websites Indexed: ' + count;
-    } else if ("crawl_complete" in data && data.crawl_query_id === crawlUUID) {
-        document.getElementById('crawl-complete').style.backgroundColor = '#28a745';
-    } else if ("index_complete" in data && data.crawl_query_id === crawlUUID) {
-        document.getElementById('index-complete').style.backgroundColor = '#28a745';
-    } else if ("search_progress" in data && data.crawl_query_id === crawlUUID) {
-        const percentage = (data.processed / data.total) * 100;
-        document.getElementById('progress').style.width = percentage + '%';
-        document.getElementById('progress-text').innerText = percentage.toFixed(2) + '%';
-    } else if ("search_results" in data && data.crawl_query_id === crawlUUID) {
-        document.getElementById('results').innerText = JSON.stringify(data.results, null, 2);
-    } else if (data.type === 'machine_active') {
+function handleWebSocketMessage(data) {
+    const isCrawlPage = window.location.pathname.includes('index.html') || window.location.pathname === '/';
+    const isSearchPage = window.location.pathname.includes('search.html');
+
+    // Handle crawl updates (index.html)
+    if (isCrawlPage && data.crawl_query_id === crawlUUID) {
+        if ("crawled_count" in data) {
+            const count = parseInt(document.getElementById('crawled-count').innerText.split(': ')[1]) + data.crawled_count;
+            document.getElementById('crawled-count').innerText = 'Number of websites Crawled: ' + count;
+        } else if ("indexed_count" in data) {
+            const count = parseInt(document.getElementById('indexed-count').innerText.split(': ')[1]) + data.indexed_count;
+            document.getElementById('indexed-count').innerText = 'Number of websites Indexed: ' + count;
+        } else if ("crawl_complete" in data) {
+            document.getElementById('crawl-complete').style.backgroundColor = '#28a745';
+            checkCrawlCompletion();
+        } else if ("index_complete" in data) {
+            document.getElementById('index-complete').style.backgroundColor = '#28a745';
+            checkCrawlCompletion();
+        }
+    }
+
+    // Handle search updates (search.html)
+    if (isSearchPage && data.crawl_query_id === crawlUUID) {
+        if ("search_progress" in data) {
+                const percentage = (data.search_progress.processed / data.search_progress.total) * 100;
+                document.getElementById('progress').style.width = percentage + '%';
+                document.getElementById('progress-text').innerText = percentage.toFixed(2) + '%';
+        } else if (data.type === "search_results") {
+                document.getElementById('results').innerText = JSON.stringify(data.results, null, 2);
+        }
+    }
+
+    // Handle machine status (both pages)
+    if (data.type === 'machine_active') {
         const machineKey = `${data.machine_type}-${data.machine_id}`;
         let nodeDiv = document.getElementById(machineKey);
         if (!nodeDiv) {
@@ -175,9 +188,9 @@ ws.onmessage = function(event) {
             nodeDiv.id = machineKey;
             nodeDiv.className = 'p-1 bg-green-500 text-white rounded mt-1';
             nodeDiv.innerText = `${data.machine_type}: ${data.machine_id} is running`;
-            if (data.machine_type === 'Crawler') {
+            if (data.machine_type === 'Crawler' && document.getElementById('crawler-nodes')) {
                 document.getElementById('crawler-nodes').appendChild(nodeDiv);
-            } else if (data.machine_type === 'Indexer') {
+            } else if (data.machine_type === 'Indexer' && document.getElementById('indexer-nodes')) {
                 document.getElementById('indexer-nodes').appendChild(nodeDiv);
             }
         } else {
@@ -195,9 +208,28 @@ ws.onmessage = function(event) {
             nodeDiv.className = 'p-1 bg-yellow-500 text-white rounded mt-1';
             nodeDiv.innerText = `${data.machine_type}: ${data.machine_id} is dead, should be replaced soon`;
             deadTimers[machineKey] = setTimeout(() => {
-                UNIQUEnodeDiv.remove();
+                nodeDiv.remove();
                 delete deadTimers[machineKey];
             }, 15 * 60 * 1000);
         }
     }
-};
+}
+
+function checkCrawlCompletion() {
+    const crawlComplete = document.getElementById('crawl-complete').style.backgroundColor === 'rgb(40, 167, 69)';
+    const indexComplete = document.getElementById('index-complete').style.backgroundColor === 'rgb(40, 167, 69)';
+    if (crawlComplete && indexComplete) {
+        isCrawlActive = false;
+        document.getElementById('crawl-btn').disabled = false;
+    }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    initializeWebSocket();
+    setMessageHandler(handleWebSocketMessage);
+    attachEventListeners();
+    crawlUUID = localStorage.getItem('crawl_uuid');
+    if (crawlUUID) {
+        subscribe(crawlUUID);
+    }
+});
