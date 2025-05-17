@@ -24,7 +24,7 @@ search_topic_path = publisher.topic_path(project_id, search_topic_name)
 updates_subscription_path = subscriber.subscription_path(project_id, updates_subscription_name)
 health_check_subscription_path = subscriber.subscription_path(project_id, health_check_subscription_name)
 
-app = Flask(__name__)
+app = Flask(_name_)
 
 connected_clients = {}
 subscriptions = {}  # crawl_query_id to list of websockets
@@ -165,7 +165,7 @@ def search():
     logging.info(f"Published search task: {json.dumps(search_task)}")
     return jsonify({"status": "search initiated"})
 
-if __name__ == '__main__':
+if _name_ == '_main_':
     loop = asyncio.get_event_loop()
     loop.run_until_complete(start_server)
     threading.Thread(target=loop.run_forever, daemon=True).start()
