@@ -1,6 +1,8 @@
 import json
 import logging
 import traceback
+import threading
+import time
 from google.cloud import pubsub_v1
 from google.cloud import storage
 import scrapy
@@ -8,7 +10,6 @@ from scrapy.crawler import CrawlerProcess
 from twisted.internet import reactor, defer
 from twisted.internet.task import LoopingCall
 from urllib.parse import urlparse
-import time
 from urllib.request import Request, urlopen
 
 # Configure a specific logger for Crawler
@@ -41,9 +42,9 @@ storage_client = storage.Client()
 bucket_name = "cse354-project-storage"
 bucket = storage_client.bucket(bucket_name)
 
-# Global sets to track crawled URLs and their depths
-crawled_urls = set()
-url_depths = {}
+# Global dictionaries to track crawled URLs and their depths per crawl_query_id
+crawled_urls = {}  # Maps crawl_query_id to set of URLs
+url_depths = {}    # Maps crawl_query_id to {url: depth}
 
 def clean_content(response):
     """Extract structured data from the webpage response."""
@@ -133,8 +134,8 @@ class CrawlerSpider(scrapy.Spider):
             new_urls = [url for url in new_urls if is_valid_url(url)]
             next_depth = self.current_depth + 1
             for url in new_urls:
-                if url not in crawled_urls:
-                    url_depths[url] = next_depth
+                if url not in crawled_urls.get(self.crawl_query_id, set()):
+                    url_depths.setdefault(self.crawl_query_id, {})[url] = next_depth
                     publisher.publish(crawl_topic_path, json.dumps({
                         "url": url,
                         "max_depth": self.max_depth,
@@ -187,12 +188,8 @@ def callback_wrapper(success, ack_id, subscription_path):
         })
         logger.info(f"Failed to crawl, nack message for retry")
 
-def crawler_process():
-    global machine_id
-    machine_id = get_machine_id()
-    logger.info("Crawler node started")
-    logger.info(f"Listening for crawl tasks on {crawl_subscription_path}...")
-    
+def run_heartbeat_in_thread(machine_id):
+    """Run periodic heartbeats in a separate thread without a Twisted reactor."""
     def send_heartbeat():
         heartbeat_message = json.dumps({
             "type": "heartbeat",
@@ -201,9 +198,20 @@ def crawler_process():
         })
         publisher.publish(health_check_topic_path, heartbeat_message.encode('utf-8'))
         logger.info(f"Published heartbeat: {heartbeat_message}")
+
+    while True:
+        send_heartbeat()
+        time.sleep(10.0)
+
+def crawler_process():
+    global machine_id
+    machine_id = get_machine_id()
+    logger.info("Crawler node started")
+    logger.info(f"Listening for crawl tasks on {crawl_subscription_path}...")
     
-    hc_lc = LoopingCall(send_heartbeat)
-    hc_lc.start(10.0)
+    # Start heartbeat in a separate thread
+    heartbeat_thread = threading.Thread(target=run_heartbeat_in_thread, args=(machine_id,), daemon=True)
+    heartbeat_thread.start()
     
     last_message_times = {}  # Track last message time per crawl_query_id
     
@@ -215,6 +223,8 @@ def crawler_process():
                 publisher.publish(updates_topic_path, json.dumps(completion_message).encode('utf-8'))
                 logger.info(f"Published crawl completion for {crawl_query_id}: {completion_message}")
                 del last_message_times[crawl_query_id]
+                crawled_urls.pop(crawl_query_id, None)  # Clear URLs for completed crawl
+                url_depths.pop(crawl_query_id, None)    # Clear depths for completed crawl
 
     completion_lc = LoopingCall(check_completion)
     completion_lc.start(1.0)
@@ -252,13 +262,39 @@ def crawler_process():
                     })
                     continue
 
-                if url_to_crawl in crawled_urls:
-                    logger.info(f"URL already crawled: {url_to_crawl}, skipping...")
+                # Initialize sets/dicts for this crawl_query_id
+                crawled_urls.setdefault(crawl_query_id, set())
+                url_depths.setdefault(crawl_query_id, {})
+
+                # Check if URL was crawled for this crawl_query_id
+                if url_to_crawl in crawled_urls[crawl_query_id]:
+                    logger.info(f"URL already crawled for this crawl_query_id {crawl_query_id}: {url_to_crawl}, skipping...")
                     subscriber.acknowledge(request={
                         "subscription": crawl_subscription_path,
                         "ack_ids": [message.ack_id],
                     })
-                    url_depths.pop(url_to_crawl, None)
+                    url_depths[crawl_query_id].pop(url_to_crawl, None)
+                    continue
+
+                # Check if URL was crawled for another crawl_query_id
+                other_crawl_ids = [cid for cid in crawled_urls if cid != crawl_query_id and url_to_crawl in crawled_urls[cid]]
+                if other_crawl_ids:
+                    logger.info(f"URL {url_to_crawl} already crawled for other crawl_query_id {other_crawl_ids}, publishing indexing task")
+                    indexing_task = {
+                        "url": url_to_crawl,
+                        "gcs_path": f"gs://{bucket_name}/crawled/{url_to_crawl.replace('/', '_')}.json",
+                        "crawl_query_id": crawl_query_id
+                    }
+                    publisher.publish(indexing_topic_path, json.dumps(indexing_task).encode('utf-8'))
+                    logger.info(f"Published indexing task for {url_to_crawl}")
+                    crawl_message = {"crawled_count": 1, "crawl_query_id": crawl_query_id}
+                    publisher.publish(updates_topic_path, json.dumps(crawl_message).encode('utf-8'))
+                    logger.info(f"Published crawled notification: {crawl_message}")
+                    crawled_urls[crawl_query_id].add(url_to_crawl)
+                    subscriber.acknowledge(request={
+                        "subscription": crawl_subscription_path,
+                        "ack_ids": [message.ack_id],
+                    })
                     continue
 
                 if current_depth > max_depth:
@@ -267,11 +303,11 @@ def crawler_process():
                         "subscription": crawl_subscription_path,
                         "ack_ids": [message.ack_id],
                     })
-                    url_depths.pop(url_to_crawl, None)
+                    url_depths[crawl_query_id].pop(url_to_crawl, None)
                     continue
 
                 crawl_url(url_to_crawl, current_depth, max_depth, crawl_query_id, lambda success: callback_wrapper(success, message.ack_id, crawl_subscription_path))
-                crawled_urls.add(url_to_crawl)
+                crawled_urls[crawl_query_id].add(url_to_crawl)
 
     lc = LoopingCall(process_message)
     lc.start(1.0)
